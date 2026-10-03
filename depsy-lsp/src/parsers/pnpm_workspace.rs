@@ -1,8 +1,10 @@
 //! Parser for pnpm `pnpm-workspace.yaml` catalog dependencies.
 
+use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::{Dependency, Parser, Span};
+use crate::file_types::PNPM_WORKSPACE_FILENAME;
 
 /// Parser for pnpm workspace catalog dependency files.
 #[derive(Debug, Default)]
@@ -66,12 +68,31 @@ pub fn resolve_catalog_references(
         .collect()
 }
 
+/// Drop lockfile-resolved versions for packages pinned by more than one catalog.
+///
+/// Lockfile lookups are keyed by package name, so when the default catalog and
+/// a named catalog (or two named catalogs) pin the same package, a single
+/// locked version cannot be attributed to either entry. Those entries fall
+/// back to their declared range.
+pub fn clear_ambiguous_resolved_versions(dependencies: &mut [Dependency]) {
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    for dependency in dependencies.iter() {
+        *occurrences.entry_ref(dependency.name.as_str()).or_default() += 1;
+    }
+
+    for dependency in dependencies.iter_mut() {
+        if occurrences.get(&dependency.name).copied().unwrap_or(0) > 1 {
+            dependency.resolved_version = None;
+        }
+    }
+}
+
 /// Find the nearest `pnpm-workspace.yaml` for a package manifest.
 pub async fn find_pnpm_workspace(package_json_path: &Path) -> Option<PathBuf> {
     let mut directory = package_json_path.parent()?.to_path_buf();
 
     loop {
-        let candidate = directory.join("pnpm-workspace.yaml");
+        let candidate = directory.join(PNPM_WORKSPACE_FILENAME);
         if tokio::fs::metadata(&candidate).await.is_ok() {
             return Some(candidate);
         }

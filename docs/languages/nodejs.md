@@ -25,6 +25,7 @@ Support for Node.js projects using package.json.
 | File | Description |
 |------|-------------|
 | `package.json` | npm/yarn/pnpm manifest |
+| `pnpm-workspace.yaml` | pnpm workspace catalogs (`catalog` and `catalogs`) |
 
 ### Lockfile Resolution
 
@@ -94,6 +95,30 @@ Depsy parses all npm dependency sections:
   }
 }
 ```
+
+### pnpm Workspace Catalogs
+
+```yaml
+packages:
+  - packages/*
+catalog:
+  react: ^18.3.1
+catalogs:
+  legacy:
+    react: ^17.0.2
+```
+
+Opening `pnpm-workspace.yaml` gives every entry of the default `catalog` and of
+each named catalog under `catalogs` the same inlay hints, diagnostics,
+vulnerability checks and update code actions as a `package.json` dependency.
+Other keys of the file (`packages`, `overrides`, ...) are ignored.
+
+In `package.json`, `catalog:` and `catalog:<name>` references resolve to the
+version pinned in the nearest `pnpm-workspace.yaml`.
+
+When a package is pinned by more than one catalog, its lockfile version cannot
+be attributed to a single entry, so those entries are checked against their
+declared range instead.
 
 ## Version Specification
 

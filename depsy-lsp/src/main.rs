@@ -255,6 +255,8 @@ async fn run_scan(
 
     let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
+    let is_pnpm_workspace = file_name == depsy_lsp::file_types::PNPM_WORKSPACE_FILENAME;
+
     // Detect file type and parse
     let (dependencies, ecosystem) = if file_name == "Cargo.toml" {
         (CargoParser::new().parse(&content), Ecosystem::CratesIo)
@@ -263,6 +265,11 @@ async fn run_scan(
         let workspace_content = pnpm_workspace::read_pnpm_workspace_for_package(&file).await;
         (
             pnpm_workspace::resolve_catalog_references(dependencies, workspace_content.as_deref()),
+            Ecosystem::Npm,
+        )
+    } else if is_pnpm_workspace {
+        (
+            pnpm_workspace::PnpmWorkspaceParser::new().parse(&content),
             Ecosystem::Npm,
         )
     } else if file_name == "requirements.txt" || file_name == "pyproject.toml" {
@@ -378,6 +385,9 @@ async fn run_scan(
         if let Some(v) = version_map.get(&key) {
             dep.resolved_version = Some(v.clone());
         }
+    }
+    if is_pnpm_workspace {
+        pnpm_workspace::clear_ambiguous_resolved_versions(&mut dependencies);
     }
 
     // Flag graph's root packages (matching manifest deps)

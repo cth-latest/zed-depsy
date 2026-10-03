@@ -1,7 +1,8 @@
 use depsy_lsp::parsers::Parser;
 use depsy_lsp::parsers::npm::NpmParser;
 use depsy_lsp::parsers::pnpm_workspace::{
-    PnpmWorkspaceParser, read_pnpm_workspace_for_package, resolve_catalog_references,
+    PnpmWorkspaceParser, clear_ambiguous_resolved_versions, read_pnpm_workspace_for_package,
+    resolve_catalog_references,
 };
 
 fn dependency_pairs(content: &str) -> Vec<(String, String)> {
@@ -301,4 +302,87 @@ async fn package_json_catalog_resolution_reads_nearest_workspace_file() {
         .unwrap();
     assert_eq!(react.version, "catalog:");
     assert_eq!(react.resolved_version.as_deref(), Some("^18.3.1"));
+}
+
+#[test]
+fn workspace_file_entries_expose_editable_name_and_version_spans() {
+    // Given a workspace file "pnpm-workspace.yaml" opened directly in the editor
+    // When Depsy inspects its catalogs
+    // Then each entry points at the name and version text on its own line
+    let workspace_yaml = r#"packages:
+  - packages/*
+catalog:
+  "@types/node": "^20.0.0"
+  lodash: ^4.17.21 # utility belt
+catalogs:
+  react18:
+    react: '^18.3.1'
+"#;
+    let lines = workspace_yaml.lines().collect::<Vec<_>>();
+    let dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);
+
+    let spanned = dependencies
+        .iter()
+        .map(|dependency| {
+            let name_line = lines[dependency.name_span.line as usize];
+            let version_line = lines[dependency.version_span.line as usize];
+            (
+                &name_line[dependency.name_span.line_start as usize
+                    ..dependency.name_span.line_end as usize],
+                &version_line[dependency.version_span.line_start as usize
+                    ..dependency.version_span.line_end as usize],
+                dependency.version_span.line,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        spanned,
+        vec![
+            ("@types/node", "^20.0.0", 3),
+            ("lodash", "^4.17.21", 4),
+            ("react", "^18.3.1", 7),
+        ]
+    );
+}
+
+#[test]
+fn lockfile_versions_are_dropped_for_packages_pinned_by_several_catalogs() {
+    // Given a workspace file whose catalogs pin "react" twice and "lodash" once
+    // And a lockfile lookup that resolved every entry by package name
+    // When Depsy removes ambiguous resolutions
+    // Then only the uniquely pinned package keeps its locked version
+    let workspace_yaml = r#"catalog:
+  lodash: ^4.17.21
+catalogs:
+  react17:
+    react: ^17.0.2
+  react18:
+    react: ^18.3.1
+"#;
+    let mut dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);
+    for dependency in &mut dependencies {
+        dependency.resolved_version = Some("18.3.1".to_string());
+    }
+
+    clear_ambiguous_resolved_versions(&mut dependencies);
+
+    let resolved = dependencies
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.name.as_str(),
+                dependency.version.as_str(),
+                dependency.resolved_version.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resolved,
+        vec![
+            ("lodash", "^4.17.21", Some("18.3.1")),
+            ("react", "^17.0.2", None),
+            ("react", "^18.3.1", None),
+        ]
+    );
 }

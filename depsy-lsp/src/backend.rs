@@ -52,7 +52,7 @@ use tower_lsp::{Client, LanguageServer};
 use crate::cache::{HybridCache, ReadCache, WriteCache};
 use crate::config::Config;
 use crate::document::DocumentState;
-use crate::file_types::FileType;
+use crate::file_types::{FileType, is_pnpm_workspace};
 use crate::parsers::Parser;
 use crate::parsers::cargo::CargoParser;
 use crate::parsers::csharp::CsharpParser;
@@ -61,7 +61,10 @@ use crate::parsers::go::GoParser;
 use crate::parsers::maven::MavenParser;
 use crate::parsers::npm::NpmParser;
 use crate::parsers::php::PhpParser;
-use crate::parsers::pnpm_workspace::{read_pnpm_workspace_for_package, resolve_catalog_references};
+use crate::parsers::pnpm_workspace::{
+    PnpmWorkspaceParser, clear_ambiguous_resolved_versions, read_pnpm_workspace_for_package,
+    resolve_catalog_references,
+};
 use crate::parsers::python::PythonParser;
 use crate::parsers::ruby::RubyParser;
 use crate::providers::code_actions::create_code_actions;
@@ -162,6 +165,7 @@ impl ProcessingContext {
     fn parse_document(&self, uri: &Url, content: &str) -> Vec<crate::parsers::Dependency> {
         match FileType::detect(uri) {
             Some(FileType::Cargo) => self.cargo_parser.parse(content),
+            Some(FileType::Npm) if is_pnpm_workspace(uri) => PnpmWorkspaceParser.parse(content),
             Some(FileType::Npm) => self.npm_parser.parse(content),
             Some(FileType::Python) => self.python_parser.parse(content),
             Some(FileType::Go) => self.go_parser.parse(content),
@@ -180,7 +184,9 @@ impl ProcessingContext {
         };
 
         let mut dependencies = self.parse_document(uri, content);
+        let is_pnpm_workspace = is_pnpm_workspace(uri);
         if file_type == FileType::Npm
+            && !is_pnpm_workspace
             && let Ok(manifest_path) = uri.to_file_path()
         {
             let workspace_content = read_pnpm_workspace_for_package(&manifest_path).await;
@@ -207,6 +213,9 @@ impl ProcessingContext {
         } else {
             None
         };
+        if is_pnpm_workspace {
+            clear_ambiguous_resolved_versions(&mut dependencies);
+        }
 
         tracing::info!(
             "Parsed {} dependencies from {}",
