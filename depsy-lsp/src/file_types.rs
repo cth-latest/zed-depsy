@@ -4,6 +4,8 @@
 //! and provides mappings to ecosystems and cache keys.
 
 use core::fmt;
+use std::ffi::OsStr;
+use std::path::Path;
 
 use tower_lsp::lsp_types::Url;
 
@@ -38,14 +40,15 @@ pub enum FileType {
 /// File name of the pnpm workspace manifest that holds dependency catalogs.
 pub const PNPM_WORKSPACE_FILENAME: &str = "pnpm-workspace.yaml";
 
-fn is_pnpm_workspace_filename(filename: &str) -> bool {
-    filename == PNPM_WORKSPACE_FILENAME
-}
-
 /// Returns `true` when `uri` points at a `pnpm-workspace.yaml` file.
 pub fn is_pnpm_workspace(uri: &Url) -> bool {
     let path = uri.path();
-    is_pnpm_workspace_filename(path.rsplit('/').next().unwrap_or(path))
+    path.rsplit('/').next().unwrap_or(path) == PNPM_WORKSPACE_FILENAME
+}
+
+/// Returns `true` when `path` points at a `pnpm-workspace.yaml` file.
+pub fn is_pnpm_workspace_path(path: &Path) -> bool {
+    path.file_name() == Some(OsStr::new(PNPM_WORKSPACE_FILENAME))
 }
 
 impl FileType {
@@ -58,7 +61,7 @@ impl FileType {
         let filename = path.rsplit('/').next().unwrap_or(path);
         if path.ends_with("Cargo.toml") {
             Some(FileType::Cargo)
-        } else if path.ends_with("package.json") || is_pnpm_workspace_filename(filename) {
+        } else if path.ends_with("package.json") || filename == PNPM_WORKSPACE_FILENAME {
             // pnpm workspace catalogs pin npm packages, so they share the npm
             // registry, cache keys and version syntax with `package.json`.
             Some(FileType::Npm)
@@ -212,6 +215,13 @@ mod tests {
             let uri = Url::parse(other).unwrap();
             assert!(!is_pnpm_workspace(&uri), "{other}");
         }
+
+        assert!(is_pnpm_workspace_path(Path::new(
+            "/project/pnpm-workspace.yaml"
+        )));
+        assert!(!is_pnpm_workspace_path(Path::new(
+            "/project/pnpm-workspace.yml"
+        )));
 
         let uri = Url::parse("file:///project/pnpm-lock.yaml").unwrap();
         assert_eq!(FileType::detect(&uri), None);

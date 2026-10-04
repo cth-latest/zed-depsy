@@ -119,9 +119,9 @@ version pinned in the nearest `pnpm-workspace.yaml`.
 Catalog entries are resolved against the `catalogs` section of the
 `pnpm-lock.yaml` next to the workspace file, so each entry gets the version
 locked for its own catalog; lockfiles of other package managers are ignored.
-Entries that no workspace project references, or whose range changed since the
-last `pnpm install`, are absent from that section and are checked against their
-declared range instead.
+Entries that no workspace project references are absent from that section, and
+entries whose range changed since the last `pnpm install` no longer match the
+locked `specifier`; both are checked against their declared range instead.
 
 ## Version Specification
 

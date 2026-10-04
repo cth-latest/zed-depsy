@@ -5,11 +5,10 @@ use depsy_lsp::parsers::lockfile_resolver::{resolve_versions_from_lockfile, sele
 use depsy_lsp::parsers::npm::NpmParser;
 use depsy_lsp::parsers::pnpm_workspace::{
     PnpmWorkspaceParser, read_pnpm_workspace_for_package, resolve_catalog_references,
-    resolve_catalog_versions_from_lockfile,
 };
 use depsy_lsp::providers::code_actions::create_code_actions;
 use depsy_lsp::registries::VersionInfo;
-use tower_lsp::lsp_types::{CodeActionOrCommand, Position, Range, TextEdit, Url};
+use tower_lsp::lsp_types::{CodeActionOrCommand, Position, Range, Url};
 
 fn dependency_pairs(content: &str) -> Vec<(String, String)> {
     let mut pairs = PnpmWorkspaceParser::new()
@@ -352,9 +351,23 @@ catalogs:
     );
 }
 
-fn locked_versions(workspace_yaml: &str, lock_yaml: &str) -> Vec<(String, String, Option<String>)> {
+/// Resolve the catalog entries of `workspace_yaml` the way the language
+/// server does, against `lock_yaml` written next to it.
+async fn locked_versions(
+    workspace_yaml: &str,
+    lock_yaml: &str,
+) -> Vec<(String, String, Option<String>)> {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace_path = tmp.path().join("pnpm-workspace.yaml");
+    std::fs::write(&workspace_path, workspace_yaml).expect("write workspace");
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), lock_yaml).expect("write pnpm-lock");
     let mut dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);
-    resolve_catalog_versions_from_lockfile(&mut dependencies, workspace_yaml, lock_yaml);
+
+    let resolver = select_resolver(FileType::Npm, &workspace_path, workspace_yaml)
+        .await
+        .expect("pnpm lockfile resolver");
+    resolve_versions_from_lockfile(&mut dependencies, resolver, &workspace_path).await;
+
     dependencies
         .into_iter()
         .map(|dependency| {
@@ -375,8 +388,8 @@ fn locked(name: &str, range: &str, version: Option<&str>) -> (String, String, Op
     )
 }
 
-#[test]
-fn catalog_entries_get_the_version_locked_for_their_own_catalog() {
+#[tokio::test]
+async fn catalog_entries_get_the_version_locked_for_their_own_catalog() {
     // Given a workspace file whose default and "legacy" catalogs both pin "react"
     // And a lockfile that records one version of "react" per catalog
     // When Depsy resolves the catalog entries from the lockfile
@@ -412,7 +425,7 @@ packages:
     resolution: {}
 "#;
 
-    let resolved = locked_versions(workspace_yaml, lock_yaml);
+    let resolved = locked_versions(workspace_yaml, lock_yaml).await;
 
     assert_eq!(
         resolved,
@@ -424,8 +437,32 @@ packages:
     );
 }
 
-#[test]
-fn unused_catalog_entries_ignore_unrelated_locked_versions_of_the_package() {
+#[tokio::test]
+async fn catalog_entries_match_quoted_lockfile_specifiers() {
+    // Given a workspace file whose catalog pins "foo" at ">=1.0.0 <2.0.0"
+    // And a lockfile that records that range in single quotes
+    // When Depsy resolves the catalog entries from the lockfile
+    // Then the entry gets its locked version
+    let workspace_yaml = "catalog:\n  foo: \">=1.0.0 <2.0.0\"\n";
+    let lock_yaml = r#"lockfileVersion: '9.0'
+
+catalogs:
+  default:
+    foo:
+      specifier: '>=1.0.0 <2.0.0'
+      version: 1.4.0
+"#;
+
+    let resolved = locked_versions(workspace_yaml, lock_yaml).await;
+
+    assert_eq!(
+        resolved,
+        vec![locked("foo", ">=1.0.0 <2.0.0", Some("1.4.0"))]
+    );
+}
+
+#[tokio::test]
+async fn unused_catalog_entries_ignore_unrelated_locked_versions_of_the_package() {
     // Given a workspace file whose catalog pins "react" at "^18.3.1"
     // And a lockfile where no project uses that entry but "react@17.0.2" is installed
     // When Depsy resolves the catalog entries from the lockfile
@@ -447,13 +484,13 @@ packages:
     resolution: {}
 "#;
 
-    let resolved = locked_versions(workspace_yaml, lock_yaml);
+    let resolved = locked_versions(workspace_yaml, lock_yaml).await;
 
     assert_eq!(resolved, vec![locked("react", "^18.3.1", None)]);
 }
 
-#[test]
-fn catalog_entries_edited_since_the_last_install_have_no_locked_version() {
+#[tokio::test]
+async fn catalog_entries_edited_since_the_last_install_have_no_locked_version() {
     // Given a workspace file whose catalog pins "react" at "^18.3.1"
     // And a lockfile written when the catalog pinned "react" at "^17.0.2"
     // When Depsy resolves the catalog entries from the lockfile
@@ -466,11 +503,104 @@ catalogs:
     react:
       specifier: ^17.0.2
       version: 17.0.2
+
+packages:
+
+  react@17.0.2:
+    resolution: {}
 "#;
 
-    let resolved = locked_versions(workspace_yaml, lock_yaml);
+    let resolved = locked_versions(workspace_yaml, lock_yaml).await;
 
     assert_eq!(resolved, vec![locked("react", "^18.3.1", None)]);
+}
+
+#[tokio::test]
+async fn workspace_file_without_catalogs_needs_no_lockfile() {
+    // Given a workspace file that only lists its packages, next to a "pnpm-lock.yaml"
+    // When Depsy looks for a lockfile for the workspace file
+    // Then no lockfile is used
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace_path = tmp.path().join("pnpm-workspace.yaml");
+    let workspace_yaml = "packages:\n  - packages/*\n";
+    std::fs::write(&workspace_path, workspace_yaml).expect("write workspace");
+    std::fs::write(
+        tmp.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .expect("write pnpm-lock");
+
+    let resolver = select_resolver(FileType::Npm, &workspace_path, workspace_yaml).await;
+
+    assert!(resolver.is_none());
+}
+
+#[tokio::test]
+async fn bulk_update_leaves_packages_pinned_by_several_catalogs_untouched() {
+    // Given a workspace file whose catalogs pin "react" twice, "lodash" and "minimist" once
+    // And the registry reports a newer version of each package
+    // When the code actions of the file are requested
+    // Then the bulk update rewrites "lodash" and "minimist" only
+    let workspace_yaml = r#"catalog:
+  lodash: ^4.17.15
+  minimist: ^1.2.0
+catalogs:
+  react17:
+    react: ^17.0.2
+  react18:
+    react: ^18.2.0
+"#;
+    let dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);
+    let cache = MemoryCache::new();
+    for (package, latest) in [
+        ("lodash", "4.18.1"),
+        ("minimist", "1.2.8"),
+        ("react", "19.1.0"),
+    ] {
+        cache
+            .insert(
+                format!("test:{package}"),
+                VersionInfo {
+                    latest: Some(latest.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
+    let uri = Url::parse("file:///test/pnpm-workspace.yaml").expect("workspace uri");
+
+    let actions = create_code_actions(
+        &dependencies,
+        &cache,
+        &uri,
+        Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, u32::MAX),
+        },
+        FileType::Npm,
+        |name| format!("test:{name}"),
+        &[],
+        None,
+        None,
+    )
+    .await;
+
+    let bulk_edit_lines = actions
+        .into_iter()
+        .find_map(|action| {
+            let CodeActionOrCommand::CodeAction(action) = action else {
+                return None;
+            };
+            if !action.title.starts_with("Update all") {
+                return None;
+            }
+            action.edit?.changes?.remove(&uri)
+        })
+        .expect("bulk update action")
+        .into_iter()
+        .map(|edit| edit.range.start.line)
+        .collect::<Vec<_>>();
+    assert_eq!(bulk_edit_lines, vec![1, 2]);
 }
 
 #[tokio::test]
@@ -521,95 +651,4 @@ async fn workspace_file_ignores_lockfiles_of_other_package_managers() {
     let resolver = select_resolver(FileType::Npm, &workspace_path, workspace_yaml).await;
 
     assert!(resolver.is_none());
-}
-
-#[tokio::test]
-async fn update_action_rewrites_only_the_catalog_entry_version() {
-    // Given a workspace file whose default and named catalogs pin outdated versions
-    // And the registry reports a newer version of each package
-    // When the update action of each catalog entry is applied
-    // Then only that entry's version is rewritten and its range operator is kept
-    let workspace_yaml = r#"packages:
-  - packages/*
-catalog:
-  lodash: ^4.17.15 # shared
-catalogs:
-  legacy:
-    "minimist": "1.2.0"
-"#;
-    let dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);
-    let cache = MemoryCache::new();
-    for (package, latest) in [("lodash", "4.18.1"), ("minimist", "1.2.8")] {
-        cache
-            .insert(
-                format!("test:{package}"),
-                VersionInfo {
-                    latest: Some(latest.to_string()),
-                    ..Default::default()
-                },
-            )
-            .await;
-    }
-    let uri = Url::parse("file:///test/pnpm-workspace.yaml").expect("workspace uri");
-
-    let mut updated = Vec::new();
-    for dependency in &dependencies {
-        let range = Range {
-            start: Position::new(dependency.version_span.line, 0),
-            end: Position::new(dependency.version_span.line, u32::MAX),
-        };
-        let actions = create_code_actions(
-            &dependencies,
-            &cache,
-            &uri,
-            range,
-            FileType::Npm,
-            |name| format!("test:{name}"),
-            &[],
-            None,
-            None,
-        )
-        .await;
-        let edit = actions
-            .into_iter()
-            .find_map(|action| {
-                let CodeActionOrCommand::CodeAction(action) = action else {
-                    return None;
-                };
-                if !action
-                    .title
-                    .contains(&format!("Update {} to", dependency.name))
-                {
-                    return None;
-                }
-                action.edit?.changes?.get(&uri)?.first().cloned()
-            })
-            .expect("update action for the catalog entry");
-        updated.push(apply_text_edit(workspace_yaml, &edit));
-    }
-
-    assert_eq!(
-        updated,
-        vec![
-            workspace_yaml.replace("^4.17.15", "^4.18.1"),
-            workspace_yaml.replace("1.2.0", "1.2.8"),
-        ]
-    );
-}
-
-fn apply_text_edit(content: &str, edit: &TextEdit) -> String {
-    let lines = content.split_inclusive('\n').collect::<Vec<_>>();
-    let offset = |position: Position| {
-        lines[..position.line as usize]
-            .iter()
-            .map(|line| line.len())
-            .sum::<usize>()
-            + position.character as usize
-    };
-    let mut updated = content.to_string();
-    updated.replace_range(
-        offset(edit.range.start)..offset(edit.range.end),
-        &edit.new_text,
-    );
-    updated
 }

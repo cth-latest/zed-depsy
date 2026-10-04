@@ -209,6 +209,8 @@ async fn run_scan(
     fail_on_vulns: bool,
     use_lockfile: bool,
 ) -> ExitCode {
+    use depsy_lsp::file_types::FileType;
+    use depsy_lsp::parsers::lockfile_resolver::{resolve_versions_from_lockfile, select_resolver};
     use depsy_lsp::parsers::{
         Parser, cargo::CargoParser, cargo_lock, composer_lock, csharp::CsharpParser,
         dart::DartParser, gemfile_lock, go::GoParser, lockfile_graph::LockfileGraph,
@@ -225,6 +227,7 @@ async fn run_scan(
         Ecosystem, VulnerabilityQuery, normalize_version_for_osv, osv::OsvClient,
     };
     use hashbrown::{HashMap, HashSet};
+    use std::sync::Arc;
 
     fn inc_sev(
         sev: depsy_lsp::registries::VulnerabilitySeverity,
@@ -255,10 +258,10 @@ async fn run_scan(
 
     let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-    let is_pnpm_workspace = file_name == depsy_lsp::file_types::PNPM_WORKSPACE_FILENAME;
+    let is_pnpm_workspace = depsy_lsp::file_types::is_pnpm_workspace_path(&file);
 
     // Detect file type and parse
-    let (dependencies, ecosystem) = if file_name == "Cargo.toml" {
+    let (mut dependencies, ecosystem) = if file_name == "Cargo.toml" {
         (CargoParser::new().parse(&content), Ecosystem::CratesIo)
     } else if file_name == "package.json" {
         let dependencies = NpmParser::new().parse(&content);
@@ -300,7 +303,6 @@ async fn run_scan(
     // For Cargo, we keep the lock content to build a disambiguated version_map separately.
     let mut lockfile_graph = LockfileGraph::default();
     let mut cargo_lock_content: Option<String> = None;
-    let mut pnpm_workspace_lock_content: Option<String> = None;
     if use_lockfile {
         match ecosystem {
             Ecosystem::CratesIo => {
@@ -313,12 +315,13 @@ async fn run_scan(
             }
             Ecosystem::Npm => {
                 if is_pnpm_workspace {
-                    // Catalogs are a pnpm feature: only the pnpm lockfile next
-                    // to the workspace file describes them.
-                    let path = file.with_file_name(pnpm_workspace::PNPM_LOCKFILE_FILENAME);
-                    if let Ok(lock_content) = read_lockfile_capped(&path).await {
-                        lockfile_graph = npm_lock::parse_pnpm_lock_graph(&lock_content);
-                        pnpm_workspace_lock_content = Some(lock_content);
+                    // A catalog entry is locked per catalog, not per package
+                    // name: resolve it the way the language server does.
+                    if let Some(resolver) = select_resolver(FileType::Npm, &file, &content).await
+                        && let Some(graph) =
+                            resolve_versions_from_lockfile(&mut dependencies, resolver, &file).await
+                    {
+                        lockfile_graph = Arc::unwrap_or_clone(graph);
                     }
                 } else if let Some((path, kind)) = npm_lock::find_npm_lockfile(&file).await
                     && let Ok(lock_content) = read_lockfile_capped(&path).await
@@ -388,17 +391,7 @@ async fn run_scan(
             .collect()
     };
 
-    let mut dependencies = dependencies;
-    if is_pnpm_workspace {
-        // A catalog entry is locked per catalog, not per package name.
-        if let Some(ref lock_content) = pnpm_workspace_lock_content {
-            pnpm_workspace::resolve_catalog_versions_from_lockfile(
-                &mut dependencies,
-                &content,
-                lock_content,
-            );
-        }
-    } else {
+    if !is_pnpm_workspace {
         for dep in dependencies.iter_mut() {
             let key = canonical_name(ecosystem, &dep.name);
             if let Some(v) = version_map.get(&key) {

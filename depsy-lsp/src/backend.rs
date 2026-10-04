@@ -160,12 +160,25 @@ struct ProcessingContext {
     >,
 }
 
+/// Parse an npm-ecosystem manifest: the catalogs of a `pnpm-workspace.yaml`,
+/// the dependency sections of a `package.json` otherwise.
+fn parse_npm_manifest(
+    uri: &Url,
+    content: &str,
+    npm_parser: &NpmParser,
+) -> Vec<crate::parsers::Dependency> {
+    if is_pnpm_workspace(uri) {
+        PnpmWorkspaceParser.parse(content)
+    } else {
+        npm_parser.parse(content)
+    }
+}
+
 impl ProcessingContext {
     fn parse_document(&self, uri: &Url, content: &str) -> Vec<crate::parsers::Dependency> {
         match FileType::detect(uri) {
             Some(FileType::Cargo) => self.cargo_parser.parse(content),
-            Some(FileType::Npm) if is_pnpm_workspace(uri) => PnpmWorkspaceParser.parse(content),
-            Some(FileType::Npm) => self.npm_parser.parse(content),
+            Some(FileType::Npm) => parse_npm_manifest(uri, content, &self.npm_parser),
             Some(FileType::Python) => self.python_parser.parse(content),
             Some(FileType::Go) => self.go_parser.parse(content),
             Some(FileType::Php) => self.php_parser.parse(content),
@@ -2016,6 +2029,34 @@ impl LanguageServer for DepsyBackend {
 mod tests {
     use super::*;
     use crate::parsers::{Dependency, Span};
+
+    #[test]
+    fn npm_manifests_are_parsed_according_to_their_file_name() {
+        // Given a pnpm workspace file with a catalog and a package.json
+        // When each is parsed as an npm manifest
+        // Then the workspace file yields its catalog entries
+        // And the package.json yields its dependency sections
+        let npm_parser = NpmParser::new();
+        let names = |uri: &str, content: &str| {
+            let uri = Url::parse(uri).unwrap();
+            parse_npm_manifest(&uri, content, &npm_parser)
+                .into_iter()
+                .map(|dependency| dependency.name)
+                .collect::<Vec<_>>()
+        };
+
+        let workspace_names = names(
+            "file:///w/pnpm-workspace.yaml",
+            "catalog:\n  react: ^18.3.1\ncatalogs:\n  legacy:\n    lodash: ^4.17.21\n",
+        );
+        let package_names = names(
+            "file:///w/package.json",
+            r#"{"dependencies": {"express": "^4.18.0"}}"#,
+        );
+
+        assert_eq!(workspace_names, vec!["react", "lodash"]);
+        assert_eq!(package_names, vec!["express"]);
+    }
 
     fn make_dep(name: &str, version: &str, resolved: Option<&str>) -> Dependency {
         Dependency {
