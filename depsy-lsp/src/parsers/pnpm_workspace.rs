@@ -1,11 +1,18 @@
 //! Parser for pnpm `pnpm-workspace.yaml` catalog dependencies.
 
+use async_trait::async_trait;
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use super::lockfile_graph::LockfileGraph;
+use super::lockfile_resolver::LockfileResolver;
+use super::npm_lock::parse_pnpm_lock_graph;
 use super::{Dependency, Parser, Span};
 use crate::file_types::PNPM_WORKSPACE_FILENAME;
+
+/// File name of the lockfile pnpm writes in the workspace root.
+pub const PNPM_LOCKFILE_FILENAME: &str = "pnpm-lock.yaml";
 
 /// Parser for pnpm workspace catalog dependency files.
 #[derive(Debug, Default)]
@@ -69,37 +76,179 @@ pub fn resolve_catalog_references(
         .collect()
 }
 
-/// Drop lockfile-resolved versions that cannot be attributed to one catalog entry.
+/// Name pnpm gives the catalog declared under the top-level `catalog` key.
+const DEFAULT_CATALOG_NAME: &str = "default";
+
+/// Version pnpm locked for one catalog entry.
+#[derive(Debug)]
+struct LockedCatalogEntry {
+    specifier: String,
+    version: String,
+}
+
+/// The `catalogs` section of a `pnpm-lock.yaml`: catalog name, then package
+/// name, to the locked entry.
 ///
-/// Lockfile lookups are keyed by package name. A locked version is therefore
-/// ambiguous when several catalogs pin the same package, or when
-/// `lockfile_graph` holds more than one version of it. Those entries fall back
-/// to their declared range.
-pub fn clear_ambiguous_resolved_versions(
-    dependencies: &mut [Dependency],
-    lockfile_graph: Option<&LockfileGraph>,
-) {
-    let mut occurrences: HashMap<String, usize> = HashMap::new();
-    for dependency in dependencies.iter() {
-        *occurrences.entry_ref(dependency.name.as_str()).or_default() += 1;
+/// pnpm records there the version it resolved for every catalog entry that a
+/// workspace project references. Entries no project references are absent.
+#[derive(Debug, Default)]
+pub struct LockedCatalogs(HashMap<String, HashMap<String, LockedCatalogEntry>>);
+
+impl LockedCatalogs {
+    /// Parse the `catalogs` section of a `pnpm-lock.yaml`.
+    ///
+    /// Uses a minimal line-based walker. A lockfile without that section
+    /// yields no entries.
+    pub fn parse(lock_content: &str) -> Self {
+        let mut catalogs: HashMap<String, HashMap<String, LockedCatalogEntry>> = HashMap::new();
+        let mut in_catalogs = false;
+        let mut catalog = String::new();
+        let mut package = String::new();
+        let mut specifier: Option<String> = None;
+
+        for line in lock_content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            if indent == 0 {
+                in_catalogs = trimmed == "catalogs:";
+                continue;
+            }
+            if !in_catalogs {
+                continue;
+            }
+            let Some(delimiter) = find_top_level_colon(trimmed) else {
+                continue;
+            };
+            let key = trim_quotes(trimmed[..delimiter].trim());
+            let value = trim_quotes(trimmed[delimiter + 1..].trim());
+            match indent {
+                2 => catalog = key.to_string(),
+                4 => {
+                    package = key.to_string();
+                    specifier = None;
+                }
+                _ if key == "specifier" => specifier = Some(value.to_string()),
+                _ if key == "version" => {
+                    if let Some(specifier) = specifier.take() {
+                        catalogs.entry_ref(catalog.as_str()).or_default().insert(
+                            package.clone(),
+                            LockedCatalogEntry {
+                                specifier,
+                                version: value.to_string(),
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Self(catalogs)
     }
 
-    for dependency in dependencies.iter_mut() {
-        let pinned_by_several_catalogs =
-            occurrences.get(&dependency.name).copied().unwrap_or(0) > 1;
-        let locked_at_several_versions = lockfile_graph.is_some_and(|graph| {
-            let mut versions = graph
-                .packages
-                .iter()
-                .filter(|package| package.name == dependency.name)
-                .map(|package| package.version.as_str());
-            versions
-                .next()
-                .is_some_and(|first| versions.any(|version| version != first))
+    /// Version locked for `dependency` as an entry of `catalog`.
+    ///
+    /// Returns `None` when no project references the entry, or when the
+    /// lockfile was written for another range than the one now declared.
+    fn version_for(&self, catalog: &str, dependency: &Dependency) -> Option<String> {
+        let entry = self.0.get(catalog)?.get(&dependency.name)?;
+        (entry.specifier == dependency.version).then(|| entry.version.clone())
+    }
+}
+
+/// Catalog of each entry of a workspace file, keyed by the position of the
+/// entry's package name (line, byte offset in the line).
+fn catalog_names_by_entry(workspace_content: &str) -> HashMap<(u32, u32), String> {
+    let default_entries = parse_default_catalog(workspace_content)
+        .into_iter()
+        .map(|dependency| (DEFAULT_CATALOG_NAME.to_string(), dependency));
+    let named_entries = parse_named_catalog_collections(workspace_content)
+        .into_iter()
+        .flat_map(|catalog| {
+            catalog
+                .dependencies
+                .into_iter()
+                .map(move |dependency| (catalog.name.clone(), dependency))
         });
-        if pinned_by_several_catalogs || locked_at_several_versions {
-            dependency.resolved_version = None;
+
+    default_entries
+        .chain(named_entries)
+        .map(|(catalog, dependency)| {
+            let position = (dependency.name_span.line, dependency.name_span.line_start);
+            (position, catalog)
+        })
+        .collect()
+}
+
+/// Set the locked version of each catalog entry parsed from `workspace_content`.
+///
+/// `dependencies` must come from [`PnpmWorkspaceParser`] run on
+/// `workspace_content`. Each entry gets the version recorded for its own
+/// catalog in the `catalogs` section of `lock_content`. Entries the lockfile
+/// does not cover are left without a locked version and are checked against
+/// their declared range.
+pub fn resolve_catalog_versions_from_lockfile(
+    dependencies: &mut [Dependency],
+    workspace_content: &str,
+    lock_content: &str,
+) {
+    let catalog_names = catalog_names_by_entry(workspace_content);
+    let locked = LockedCatalogs::parse(lock_content);
+    for dependency in dependencies.iter_mut() {
+        let position = (dependency.name_span.line, dependency.name_span.line_start);
+        dependency.resolved_version = catalog_names
+            .get(&position)
+            .and_then(|catalog| locked.version_for(catalog, dependency));
+    }
+}
+
+/// Resolves the catalog entries of a `pnpm-workspace.yaml` from the
+/// `pnpm-lock.yaml` next to it.
+///
+/// Lockfiles of other package managers are never used: catalogs are a pnpm
+/// feature and pnpm writes its lockfile in the workspace root.
+pub struct PnpmWorkspaceResolver {
+    lock_path: PathBuf,
+    catalog_names: HashMap<(u32, u32), String>,
+    locked: OnceLock<LockedCatalogs>,
+}
+
+impl PnpmWorkspaceResolver {
+    /// Creates the resolver for the workspace file at `workspace_path`.
+    ///
+    /// Returns `None` when no `pnpm-lock.yaml` sits next to it.
+    pub async fn for_workspace(workspace_path: &Path, workspace_content: &str) -> Option<Self> {
+        let lock_path = workspace_path.parent()?.join(PNPM_LOCKFILE_FILENAME);
+        if !tokio::fs::try_exists(&lock_path).await.unwrap_or(false) {
+            return None;
         }
+        Some(Self {
+            lock_path,
+            catalog_names: catalog_names_by_entry(workspace_content),
+            locked: OnceLock::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl LockfileResolver for PnpmWorkspaceResolver {
+    async fn find_lockfile(&self, _manifest_path: &Path) -> Option<PathBuf> {
+        Some(self.lock_path.clone())
+    }
+
+    fn parse_graph(&self, lock_content: &str) -> LockfileGraph {
+        // First parse wins; a resolver serves a single lockfile read.
+        let _ = self.locked.set(LockedCatalogs::parse(lock_content));
+        parse_pnpm_lock_graph(lock_content)
+    }
+
+    fn resolve_version(&self, dep: &Dependency, _graph: &LockfileGraph) -> Option<String> {
+        let position = (dep.name_span.line, dep.name_span.line_start);
+        let catalog = self.catalog_names.get(&position)?;
+        self.locked.get()?.version_for(catalog, dep)
     }
 }
 

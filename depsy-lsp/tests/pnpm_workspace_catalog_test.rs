@@ -1,25 +1,15 @@
 use depsy_lsp::cache::{MemoryCache, WriteCache};
 use depsy_lsp::file_types::FileType;
 use depsy_lsp::parsers::Parser;
-use depsy_lsp::parsers::lockfile_graph::{LockfileGraph, LockfilePackage};
 use depsy_lsp::parsers::lockfile_resolver::{resolve_versions_from_lockfile, select_resolver};
 use depsy_lsp::parsers::npm::NpmParser;
 use depsy_lsp::parsers::pnpm_workspace::{
-    PnpmWorkspaceParser, clear_ambiguous_resolved_versions, read_pnpm_workspace_for_package,
-    resolve_catalog_references,
+    PnpmWorkspaceParser, read_pnpm_workspace_for_package, resolve_catalog_references,
+    resolve_catalog_versions_from_lockfile,
 };
 use depsy_lsp::providers::code_actions::create_code_actions;
 use depsy_lsp::registries::VersionInfo;
 use tower_lsp::lsp_types::{CodeActionOrCommand, Position, Range, TextEdit, Url};
-
-fn locked_package(name: &str, version: &str) -> LockfilePackage {
-    LockfilePackage {
-        name: name.to_string(),
-        version: version.to_string(),
-        dependencies: Vec::new(),
-        is_root: false,
-    }
-}
 
 fn dependency_pairs(content: &str) -> Vec<(String, String)> {
     let mut pairs = PnpmWorkspaceParser::new()
@@ -362,78 +352,125 @@ catalogs:
     );
 }
 
-#[test]
-fn lockfile_versions_are_dropped_for_packages_pinned_by_several_catalogs() {
-    // Given a workspace file whose catalogs pin "react" twice and "lodash" once
-    // And a lockfile lookup that resolved every entry by package name
-    // When Depsy removes ambiguous resolutions
-    // Then only the uniquely pinned package keeps its locked version
-    let workspace_yaml = r#"catalog:
-  lodash: ^4.17.21
-catalogs:
-  react17:
-    react: ^17.0.2
-  react18:
-    react: ^18.3.1
-"#;
+fn locked_versions(workspace_yaml: &str, lock_yaml: &str) -> Vec<(String, String, Option<String>)> {
     let mut dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);
-    for dependency in &mut dependencies {
-        dependency.resolved_version = Some("18.3.1".to_string());
-    }
-
-    clear_ambiguous_resolved_versions(&mut dependencies, None);
-
-    let resolved = dependencies
-        .iter()
+    resolve_catalog_versions_from_lockfile(&mut dependencies, workspace_yaml, lock_yaml);
+    dependencies
+        .into_iter()
         .map(|dependency| {
             (
-                dependency.name.as_str(),
-                dependency.version.as_str(),
-                dependency.resolved_version.as_deref(),
+                dependency.name,
+                dependency.version,
+                dependency.resolved_version,
             )
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn locked(name: &str, range: &str, version: Option<&str>) -> (String, String, Option<String>) {
+    (
+        name.to_string(),
+        range.to_string(),
+        version.map(str::to_string),
+    )
+}
+
+#[test]
+fn catalog_entries_get_the_version_locked_for_their_own_catalog() {
+    // Given a workspace file whose default and "legacy" catalogs both pin "react"
+    // And a lockfile that records one version of "react" per catalog
+    // When Depsy resolves the catalog entries from the lockfile
+    // Then each entry gets the version locked for its own catalog
+    let workspace_yaml = r#"catalog:
+  react: ^18.3.1
+  "@types/node": ^20.0.0
+catalogs:
+  legacy:
+    react: ^17.0.2
+"#;
+    let lock_yaml = r#"lockfileVersion: '9.0'
+
+catalogs:
+  default:
+    '@types/node':
+      specifier: ^20.0.0
+      version: 20.11.5
+    react:
+      specifier: ^18.3.1
+      version: 18.3.1
+  legacy:
+    react:
+      specifier: ^17.0.2
+      version: 17.0.2
+
+packages:
+
+  react@17.0.2:
+    resolution: {}
+
+  react@18.3.1:
+    resolution: {}
+"#;
+
+    let resolved = locked_versions(workspace_yaml, lock_yaml);
+
     assert_eq!(
         resolved,
         vec![
-            ("lodash", "^4.17.21", Some("18.3.1")),
-            ("react", "^17.0.2", None),
-            ("react", "^18.3.1", None),
+            locked("react", "^18.3.1", Some("18.3.1")),
+            locked("@types/node", "^20.0.0", Some("20.11.5")),
+            locked("react", "^17.0.2", Some("17.0.2")),
         ]
     );
 }
 
 #[test]
-fn lockfile_versions_are_dropped_for_packages_locked_at_several_versions() {
-    // Given a workspace file whose catalog pins "react" and "lodash" once each
-    // And a lockfile that holds two versions of "react" and one of "lodash"
-    // When Depsy removes ambiguous resolutions
-    // Then only the package locked at a single version keeps its locked version
-    let workspace_yaml = "catalog:\n  lodash: ^4.17.21\n  react: ^18.3.1\n";
-    let mut dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);
-    for dependency in &mut dependencies {
-        dependency.resolved_version = Some("17.0.2".to_string());
-    }
-    let lockfile_graph = LockfileGraph {
-        packages: vec![
-            locked_package("lodash", "4.17.21"),
-            locked_package("react", "17.0.2"),
-            locked_package("react", "18.3.1"),
-        ],
-    };
+fn unused_catalog_entries_ignore_unrelated_locked_versions_of_the_package() {
+    // Given a workspace file whose catalog pins "react" at "^18.3.1"
+    // And a lockfile where no project uses that entry but "react@17.0.2" is installed
+    // When Depsy resolves the catalog entries from the lockfile
+    // Then the entry has no locked version
+    let workspace_yaml = "catalog:\n  react: ^18.3.1\n";
+    let lock_yaml = r#"lockfileVersion: '9.0'
 
-    clear_ambiguous_resolved_versions(&mut dependencies, Some(&lockfile_graph));
+importers:
 
-    let resolved = dependencies
-        .iter()
-        .map(|dependency| {
-            (
-                dependency.name.as_str(),
-                dependency.resolved_version.as_deref(),
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(resolved, vec![("lodash", Some("17.0.2")), ("react", None)]);
+  .:
+    dependencies:
+      react:
+        specifier: ^17.0.2
+        version: 17.0.2
+
+packages:
+
+  react@17.0.2:
+    resolution: {}
+"#;
+
+    let resolved = locked_versions(workspace_yaml, lock_yaml);
+
+    assert_eq!(resolved, vec![locked("react", "^18.3.1", None)]);
+}
+
+#[test]
+fn catalog_entries_edited_since_the_last_install_have_no_locked_version() {
+    // Given a workspace file whose catalog pins "react" at "^18.3.1"
+    // And a lockfile written when the catalog pinned "react" at "^17.0.2"
+    // When Depsy resolves the catalog entries from the lockfile
+    // Then the entry has no locked version
+    let workspace_yaml = "catalog:\n  react: ^18.3.1\n";
+    let lock_yaml = r#"lockfileVersion: '9.0'
+
+catalogs:
+  default:
+    react:
+      specifier: ^17.0.2
+      version: 17.0.2
+"#;
+
+    let resolved = locked_versions(workspace_yaml, lock_yaml);
+
+    assert_eq!(resolved, vec![locked("react", "^18.3.1", None)]);
 }
 
 #[tokio::test]
@@ -453,7 +490,7 @@ async fn workspace_file_versions_are_resolved_from_the_pnpm_lockfile_only() {
     .expect("write package-lock");
     std::fs::write(
         tmp.path().join("pnpm-lock.yaml"),
-        "lockfileVersion: '9.0'\npackages:\n  lodash@4.17.21:\n    resolution: {}\n",
+        "lockfileVersion: '9.0'\ncatalogs:\n  default:\n    lodash:\n      specifier: ^4.17.0\n      version: 4.17.21\npackages:\n  lodash@4.17.21:\n    resolution: {}\n",
     )
     .expect("write pnpm-lock");
     let mut dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);

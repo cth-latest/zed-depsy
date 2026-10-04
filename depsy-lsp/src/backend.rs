@@ -62,8 +62,7 @@ use crate::parsers::maven::MavenParser;
 use crate::parsers::npm::NpmParser;
 use crate::parsers::php::PhpParser;
 use crate::parsers::pnpm_workspace::{
-    PnpmWorkspaceParser, clear_ambiguous_resolved_versions, read_pnpm_workspace_for_package,
-    resolve_catalog_references,
+    PnpmWorkspaceParser, read_pnpm_workspace_for_package, resolve_catalog_references,
 };
 use crate::parsers::python::PythonParser;
 use crate::parsers::ruby::RubyParser;
@@ -213,9 +212,6 @@ impl ProcessingContext {
         } else {
             None
         };
-        if is_pnpm_workspace {
-            clear_ambiguous_resolved_versions(&mut dependencies, lockfile_graph.as_deref());
-        }
 
         tracing::info!(
             "Parsed {} dependencies from {}",

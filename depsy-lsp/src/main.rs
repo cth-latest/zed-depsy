@@ -300,6 +300,7 @@ async fn run_scan(
     // For Cargo, we keep the lock content to build a disambiguated version_map separately.
     let mut lockfile_graph = LockfileGraph::default();
     let mut cargo_lock_content: Option<String> = None;
+    let mut pnpm_workspace_lock_content: Option<String> = None;
     if use_lockfile {
         match ecosystem {
             Ecosystem::CratesIo => {
@@ -311,12 +312,15 @@ async fn run_scan(
                 }
             }
             Ecosystem::Npm => {
-                let lockfile = if is_pnpm_workspace {
-                    npm_lock::find_pnpm_workspace_lockfile(&file).await
-                } else {
-                    npm_lock::find_npm_lockfile(&file).await
-                };
-                if let Some((path, kind)) = lockfile
+                if is_pnpm_workspace {
+                    // Catalogs are a pnpm feature: only the pnpm lockfile next
+                    // to the workspace file describes them.
+                    let path = file.with_file_name(pnpm_workspace::PNPM_LOCKFILE_FILENAME);
+                    if let Ok(lock_content) = read_lockfile_capped(&path).await {
+                        lockfile_graph = npm_lock::parse_pnpm_lock_graph(&lock_content);
+                        pnpm_workspace_lock_content = Some(lock_content);
+                    }
+                } else if let Some((path, kind)) = npm_lock::find_npm_lockfile(&file).await
                     && let Ok(lock_content) = read_lockfile_capped(&path).await
                 {
                     lockfile_graph = match kind {
@@ -385,14 +389,22 @@ async fn run_scan(
     };
 
     let mut dependencies = dependencies;
-    for dep in dependencies.iter_mut() {
-        let key = canonical_name(ecosystem, &dep.name);
-        if let Some(v) = version_map.get(&key) {
-            dep.resolved_version = Some(v.clone());
-        }
-    }
     if is_pnpm_workspace {
-        pnpm_workspace::clear_ambiguous_resolved_versions(&mut dependencies, Some(&lockfile_graph));
+        // A catalog entry is locked per catalog, not per package name.
+        if let Some(ref lock_content) = pnpm_workspace_lock_content {
+            pnpm_workspace::resolve_catalog_versions_from_lockfile(
+                &mut dependencies,
+                &content,
+                lock_content,
+            );
+        }
+    } else {
+        for dep in dependencies.iter_mut() {
+            let key = canonical_name(ecosystem, &dep.name);
+            if let Some(v) = version_map.get(&key) {
+                dep.resolved_version = Some(v.clone());
+            }
+        }
     }
 
     // Flag graph's root packages (matching manifest deps)
