@@ -97,8 +97,13 @@ pub async fn select_resolver(
             }))
         }
         FileType::Npm => {
-            let (lock_path, sub) =
-                crate::parsers::npm_lock::find_npm_lockfile(manifest_path).await?;
+            let (lock_path, sub) = if manifest_path.file_name()
+                == Some(OsStr::new(crate::file_types::PNPM_WORKSPACE_FILENAME))
+            {
+                crate::parsers::npm_lock::find_pnpm_workspace_lockfile(manifest_path).await?
+            } else {
+                crate::parsers::npm_lock::find_npm_lockfile(manifest_path).await?
+            };
             Some(Box::new(crate::parsers::npm_lock::NpmResolver {
                 lock_path,
                 sub,

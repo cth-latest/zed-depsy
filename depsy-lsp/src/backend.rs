@@ -214,7 +214,7 @@ impl ProcessingContext {
             None
         };
         if is_pnpm_workspace {
-            clear_ambiguous_resolved_versions(&mut dependencies);
+            clear_ambiguous_resolved_versions(&mut dependencies, lockfile_graph.as_deref());
         }
 
         tracing::info!(

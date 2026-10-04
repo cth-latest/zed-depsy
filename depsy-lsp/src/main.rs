@@ -311,7 +311,12 @@ async fn run_scan(
                 }
             }
             Ecosystem::Npm => {
-                if let Some((path, kind)) = npm_lock::find_npm_lockfile(&file).await
+                let lockfile = if is_pnpm_workspace {
+                    npm_lock::find_pnpm_workspace_lockfile(&file).await
+                } else {
+                    npm_lock::find_npm_lockfile(&file).await
+                };
+                if let Some((path, kind)) = lockfile
                     && let Ok(lock_content) = read_lockfile_capped(&path).await
                 {
                     lockfile_graph = match kind {
@@ -387,7 +392,7 @@ async fn run_scan(
         }
     }
     if is_pnpm_workspace {
-        pnpm_workspace::clear_ambiguous_resolved_versions(&mut dependencies);
+        pnpm_workspace::clear_ambiguous_resolved_versions(&mut dependencies, Some(&lockfile_graph));
     }
 
     // Flag graph's root packages (matching manifest deps)

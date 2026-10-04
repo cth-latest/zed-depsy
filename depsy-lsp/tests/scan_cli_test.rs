@@ -393,6 +393,11 @@ catalogs:
         .as_array()
         .expect("querybatch.queries should be an array");
 
+    assert_eq!(
+        queries.len(),
+        3,
+        "expected exactly three OSV queries for the catalog entries, got {queries:?}"
+    );
     for (package_name, version) in [
         ("lodash", "4.17.21"),
         ("react", "17.0.2"),

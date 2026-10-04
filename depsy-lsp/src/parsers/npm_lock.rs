@@ -64,6 +64,21 @@ pub async fn find_npm_lockfile(package_json_path: &Path) -> Option<(PathBuf, Npm
     }
 }
 
+/// Find the `pnpm-lock.yaml` written next to a `pnpm-workspace.yaml`.
+///
+/// Catalogs are a pnpm feature, so lockfiles of other package managers are
+/// never used for a workspace file, and pnpm always writes its lockfile in the
+/// workspace root.
+pub async fn find_pnpm_workspace_lockfile(
+    workspace_path: &Path,
+) -> Option<(PathBuf, NpmLockfileType)> {
+    let candidate = workspace_path.parent()?.join("pnpm-lock.yaml");
+    tokio::fs::try_exists(&candidate)
+        .await
+        .unwrap_or(false)
+        .then_some((candidate, NpmLockfileType::PnpmLock))
+}
+
 /// Parse a Node.js lockfile and return a map of package name → resolved version.
 ///
 /// Dispatches to the appropriate sub-parser based on `lockfile_type`.

@@ -1,9 +1,25 @@
+use depsy_lsp::cache::{MemoryCache, WriteCache};
+use depsy_lsp::file_types::FileType;
 use depsy_lsp::parsers::Parser;
+use depsy_lsp::parsers::lockfile_graph::{LockfileGraph, LockfilePackage};
+use depsy_lsp::parsers::lockfile_resolver::{resolve_versions_from_lockfile, select_resolver};
 use depsy_lsp::parsers::npm::NpmParser;
 use depsy_lsp::parsers::pnpm_workspace::{
     PnpmWorkspaceParser, clear_ambiguous_resolved_versions, read_pnpm_workspace_for_package,
     resolve_catalog_references,
 };
+use depsy_lsp::providers::code_actions::create_code_actions;
+use depsy_lsp::registries::VersionInfo;
+use tower_lsp::lsp_types::{CodeActionOrCommand, Position, Range, TextEdit, Url};
+
+fn locked_package(name: &str, version: &str) -> LockfilePackage {
+    LockfilePackage {
+        name: name.to_string(),
+        version: version.to_string(),
+        dependencies: Vec::new(),
+        is_root: false,
+    }
+}
 
 fn dependency_pairs(content: &str) -> Vec<(String, String)> {
     let mut pairs = PnpmWorkspaceParser::new()
@@ -365,7 +381,7 @@ catalogs:
         dependency.resolved_version = Some("18.3.1".to_string());
     }
 
-    clear_ambiguous_resolved_versions(&mut dependencies);
+    clear_ambiguous_resolved_versions(&mut dependencies, None);
 
     let resolved = dependencies
         .iter()
@@ -385,4 +401,178 @@ catalogs:
             ("react", "^18.3.1", None),
         ]
     );
+}
+
+#[test]
+fn lockfile_versions_are_dropped_for_packages_locked_at_several_versions() {
+    // Given a workspace file whose catalog pins "react" and "lodash" once each
+    // And a lockfile that holds two versions of "react" and one of "lodash"
+    // When Depsy removes ambiguous resolutions
+    // Then only the package locked at a single version keeps its locked version
+    let workspace_yaml = "catalog:\n  lodash: ^4.17.21\n  react: ^18.3.1\n";
+    let mut dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);
+    for dependency in &mut dependencies {
+        dependency.resolved_version = Some("17.0.2".to_string());
+    }
+    let lockfile_graph = LockfileGraph {
+        packages: vec![
+            locked_package("lodash", "4.17.21"),
+            locked_package("react", "17.0.2"),
+            locked_package("react", "18.3.1"),
+        ],
+    };
+
+    clear_ambiguous_resolved_versions(&mut dependencies, Some(&lockfile_graph));
+
+    let resolved = dependencies
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.name.as_str(),
+                dependency.resolved_version.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(resolved, vec![("lodash", Some("17.0.2")), ("react", None)]);
+}
+
+#[tokio::test]
+async fn workspace_file_versions_are_resolved_from_the_pnpm_lockfile_only() {
+    // Given a workspace root that holds "pnpm-workspace.yaml", "pnpm-lock.yaml"
+    // and a stale "package-lock.json"
+    // When Depsy resolves the catalog entries from the lockfile
+    // Then the versions come from "pnpm-lock.yaml"
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace_path = tmp.path().join("pnpm-workspace.yaml");
+    let workspace_yaml = "catalog:\n  lodash: ^4.17.0\n";
+    std::fs::write(&workspace_path, workspace_yaml).expect("write workspace");
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        r#"{"lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.17.15"}}}"#,
+    )
+    .expect("write package-lock");
+    std::fs::write(
+        tmp.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\npackages:\n  lodash@4.17.21:\n    resolution: {}\n",
+    )
+    .expect("write pnpm-lock");
+    let mut dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);
+
+    let resolver = select_resolver(FileType::Npm, &workspace_path, workspace_yaml)
+        .await
+        .expect("pnpm lockfile resolver");
+    resolve_versions_from_lockfile(&mut dependencies, resolver, &workspace_path).await;
+
+    assert_eq!(dependencies[0].resolved_version.as_deref(), Some("4.17.21"));
+}
+
+#[tokio::test]
+async fn workspace_file_ignores_lockfiles_of_other_package_managers() {
+    // Given a workspace root that holds "pnpm-workspace.yaml" and only a "package-lock.json"
+    // When Depsy looks for a lockfile for the workspace file
+    // Then no lockfile is used
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace_path = tmp.path().join("pnpm-workspace.yaml");
+    let workspace_yaml = "catalog:\n  lodash: ^4.17.0\n";
+    std::fs::write(&workspace_path, workspace_yaml).expect("write workspace");
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        r#"{"lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.17.15"}}}"#,
+    )
+    .expect("write package-lock");
+
+    let resolver = select_resolver(FileType::Npm, &workspace_path, workspace_yaml).await;
+
+    assert!(resolver.is_none());
+}
+
+#[tokio::test]
+async fn update_action_rewrites_only_the_catalog_entry_version() {
+    // Given a workspace file whose default and named catalogs pin outdated versions
+    // And the registry reports a newer version of each package
+    // When the update action of each catalog entry is applied
+    // Then only that entry's version is rewritten and its range operator is kept
+    let workspace_yaml = r#"packages:
+  - packages/*
+catalog:
+  lodash: ^4.17.15 # shared
+catalogs:
+  legacy:
+    "minimist": "1.2.0"
+"#;
+    let dependencies = PnpmWorkspaceParser::new().parse(workspace_yaml);
+    let cache = MemoryCache::new();
+    for (package, latest) in [("lodash", "4.18.1"), ("minimist", "1.2.8")] {
+        cache
+            .insert(
+                format!("test:{package}"),
+                VersionInfo {
+                    latest: Some(latest.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
+    let uri = Url::parse("file:///test/pnpm-workspace.yaml").expect("workspace uri");
+
+    let mut updated = Vec::new();
+    for dependency in &dependencies {
+        let range = Range {
+            start: Position::new(dependency.version_span.line, 0),
+            end: Position::new(dependency.version_span.line, u32::MAX),
+        };
+        let actions = create_code_actions(
+            &dependencies,
+            &cache,
+            &uri,
+            range,
+            FileType::Npm,
+            |name| format!("test:{name}"),
+            &[],
+            None,
+            None,
+        )
+        .await;
+        let edit = actions
+            .into_iter()
+            .find_map(|action| {
+                let CodeActionOrCommand::CodeAction(action) = action else {
+                    return None;
+                };
+                if !action
+                    .title
+                    .contains(&format!("Update {} to", dependency.name))
+                {
+                    return None;
+                }
+                action.edit?.changes?.get(&uri)?.first().cloned()
+            })
+            .expect("update action for the catalog entry");
+        updated.push(apply_text_edit(workspace_yaml, &edit));
+    }
+
+    assert_eq!(
+        updated,
+        vec![
+            workspace_yaml.replace("^4.17.15", "^4.18.1"),
+            workspace_yaml.replace("1.2.0", "1.2.8"),
+        ]
+    );
+}
+
+fn apply_text_edit(content: &str, edit: &TextEdit) -> String {
+    let lines = content.split_inclusive('\n').collect::<Vec<_>>();
+    let offset = |position: Position| {
+        lines[..position.line as usize]
+            .iter()
+            .map(|line| line.len())
+            .sum::<usize>()
+            + position.character as usize
+    };
+    let mut updated = content.to_string();
+    updated.replace_range(
+        offset(edit.range.start)..offset(edit.range.end),
+        &edit.new_text,
+    );
+    updated
 }

@@ -3,6 +3,7 @@
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::lockfile_graph::LockfileGraph;
 use super::{Dependency, Parser, Span};
 use crate::file_types::PNPM_WORKSPACE_FILENAME;
 
@@ -68,20 +69,35 @@ pub fn resolve_catalog_references(
         .collect()
 }
 
-/// Drop lockfile-resolved versions for packages pinned by more than one catalog.
+/// Drop lockfile-resolved versions that cannot be attributed to one catalog entry.
 ///
-/// Lockfile lookups are keyed by package name, so when the default catalog and
-/// a named catalog (or two named catalogs) pin the same package, a single
-/// locked version cannot be attributed to either entry. Those entries fall
-/// back to their declared range.
-pub fn clear_ambiguous_resolved_versions(dependencies: &mut [Dependency]) {
+/// Lockfile lookups are keyed by package name. A locked version is therefore
+/// ambiguous when several catalogs pin the same package, or when
+/// `lockfile_graph` holds more than one version of it. Those entries fall back
+/// to their declared range.
+pub fn clear_ambiguous_resolved_versions(
+    dependencies: &mut [Dependency],
+    lockfile_graph: Option<&LockfileGraph>,
+) {
     let mut occurrences: HashMap<String, usize> = HashMap::new();
     for dependency in dependencies.iter() {
         *occurrences.entry_ref(dependency.name.as_str()).or_default() += 1;
     }
 
     for dependency in dependencies.iter_mut() {
-        if occurrences.get(&dependency.name).copied().unwrap_or(0) > 1 {
+        let pinned_by_several_catalogs =
+            occurrences.get(&dependency.name).copied().unwrap_or(0) > 1;
+        let locked_at_several_versions = lockfile_graph.is_some_and(|graph| {
+            let mut versions = graph
+                .packages
+                .iter()
+                .filter(|package| package.name == dependency.name)
+                .map(|package| package.version.as_str());
+            versions
+                .next()
+                .is_some_and(|first| versions.any(|version| version != first))
+        });
+        if pinned_by_several_catalogs || locked_at_several_versions {
             dependency.resolved_version = None;
         }
     }

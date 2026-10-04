@@ -43,6 +43,7 @@ Depsy automatically detects dependency files by name:
 ```
 Cargo.toml        → Rust
 package.json      → Node.js
+pnpm-workspace.yaml         → Node.js
 requirements.txt  → Python
 pyproject.toml    → Python
 go.mod            → Go

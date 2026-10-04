@@ -116,9 +116,11 @@ Other keys of the file (`packages`, `overrides`, ...) are ignored.
 In `package.json`, `catalog:` and `catalog:<name>` references resolve to the
 version pinned in the nearest `pnpm-workspace.yaml`.
 
-When a package is pinned by more than one catalog, its lockfile version cannot
-be attributed to a single entry, so those entries are checked against their
-declared range instead.
+Catalog entries are resolved against the `pnpm-lock.yaml` next to the workspace
+file; lockfiles of other package managers are ignored. When a package is pinned
+by more than one catalog, or locked at more than one version, its lockfile
+version cannot be attributed to a single entry, so those entries are checked
+against their declared range instead.
 
 ## Version Specification
 
